@@ -127,6 +127,8 @@ describe("CLI", () => {
             enum: ["openai", "openrouter", "fireworks", "amazon-bedrock"],
           },
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
+          patch: { type: "boolean" },
+          patchSeverity: { enum: ["critical", "high", "medium", "low"] },
           headless: { type: "boolean" },
         },
       },
@@ -2073,7 +2075,6 @@ describe("CLI", () => {
   test("rejects structured modes before starting interactive Codex commands", async () => {
     for (const [command, arguments_] of [
       ["validate", ["finding"]],
-      ["patch", ["issue"]],
       ["login", []],
       ["login", ["status"]],
       ["logout", []],
