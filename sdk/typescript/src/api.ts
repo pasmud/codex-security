@@ -12,7 +12,15 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { Codex, type CodexOptions } from "@openai/codex-sdk";
 import {
   parse as parseToml,
@@ -86,6 +94,7 @@ import {
   codexSecurityHasStoredFileCredentials,
   codexSecurityStateDirectory,
   createIsolatedHome,
+  expandHome,
   importAmbientAuth,
   prepareCodexSecurityCredentialHome,
   preserveCodexSecurityPluginRegistration,
@@ -479,7 +488,13 @@ export class CodexSecurity {
       }
       checkOpen();
 
-      const requestedConfig = await mergedCodexConfig(this.config);
+      const inheritedFilesystem = await inheritAmbientFilesystemDenials(
+        await mergedCodexConfig(this.config),
+        this.#dependencies.environment,
+        repo,
+        signal,
+      );
+      const requestedConfig = inheritedFilesystem.config;
       const modelProvider = scanModelProvider(requestedConfig);
       const externalProvider = isExternalModelProvider(modelProvider)
         ? EXTERNAL_CODEX_PROVIDERS[modelProvider]
@@ -802,7 +817,19 @@ export class CodexSecurity {
         mode,
         expectation.repositoryRevision,
         runtime.plugin.version,
-        preflightConfig,
+        Object.keys(inheritedFilesystem.explicitDenials).some(
+          (path) => path !== "glob_scan_max_depth",
+        )
+          ? {
+              ...preflightConfig,
+              default_permissions: SCAN_PERMISSION_PROFILE,
+              permissions: {
+                [SCAN_PERMISSION_PROFILE]: {
+                  filesystem: inheritedFilesystem.explicitDenials,
+                },
+              },
+            }
+          : preflightConfig,
         options.failureSeverity,
         knowledgeBase?.sources,
         options.maxCostUsd,
@@ -1077,13 +1104,70 @@ export class CodexSecurity {
         await chmod(targetPathsFile, 0o400);
       }
       checkOpen();
+      const configuredPermissions = requestedConfig["permissions"];
+      const configuredProfile = isRecord(configuredPermissions)
+        ? configuredPermissions[SCAN_PERMISSION_PROFILE]
+        : undefined;
+      const configuredFilesystem = isRecord(configuredProfile)
+        ? configuredProfile["filesystem"]
+        : undefined;
+      const runProtectedTurn = async (
+        input: string,
+      ): ReturnType<CodexThreadLike["runStreamed"]> => {
+        let { events } = await thread.runStreamed(input, { signal });
+        if (
+          this.#dependencies.prepareRuntime === undefined &&
+          isRecord(configuredFilesystem) &&
+          Object.keys(configuredFilesystem).some(
+            (path) => path !== "glob_scan_max_depth",
+          )
+        ) {
+          const alreadyLocked = releaseCredentialHome !== null;
+          if (!alreadyLocked) {
+            releaseCredentialHome =
+              await acquireCodexSecurityCredentialHomeLock(
+                runtime.codexHome,
+                signal,
+              );
+          }
+          try {
+            const isolatedPermissions =
+              await preserveCodexSecurityPluginRegistration(
+                runtime.codexHome,
+                sharedCredentialCodexConfig(
+                  effectiveConfig,
+                  stateDirectory,
+                  runtimeHome,
+                ),
+              );
+            await writeCodexConfig(
+              join(runtime.codexHome, "config.toml"),
+              isolatedPermissions,
+            );
+            // Every streamed turn starts a new Codex process lazily. Keep the
+            // shared home locked until this process has loaded its profile.
+            const first = await events.next();
+            if (!first.done) {
+              const remaining = events;
+              events = (async function* () {
+                yield first.value;
+                yield* remaining;
+              })();
+            }
+          } finally {
+            if (!alreadyLocked) {
+              await releaseCredentialHome?.();
+              releaseCredentialHome = null;
+            }
+          }
+        }
+        return { events };
+      };
       const postScanPrompt = options.postScanPrompt;
       if (postScanPrompt?.trim()) {
-        runPostScan = () => thread.runStreamed(postScanPrompt, { signal });
+        runPostScan = () => runProtectedTurn(postScanPrompt);
       }
-      const { events } = await thread.runStreamed(prompt, {
-        signal,
-      });
+      const { events } = await runProtectedTurn(prompt);
       checkOpen();
 
       const result = await runScanEvents({
@@ -2827,6 +2911,337 @@ export function classifyConnectionFailure(
   return "unknown";
 }
 
+interface PermissionFilesystem {
+  entries: JsonObject;
+  workspaceRoots: string[];
+}
+
+async function inheritAmbientFilesystemDenials(
+  config: JsonObject,
+  environment: ProcessEnvironment,
+  repository: string,
+  signal: AbortSignal,
+): Promise<{ config: JsonObject; explicitDenials: JsonObject }> {
+  const ambientHome = resolve(
+    expandHome(
+      environmentValue(environment, "CODEX_HOME") ?? join(homedir(), ".codex"),
+    ),
+  );
+  const source = join(ambientHome, "config.toml");
+  let ambient: JsonObject = {};
+  try {
+    ambient = parseToml(
+      await readFile(source, { encoding: "utf8", signal }),
+    ) as JsonObject;
+  } catch (error) {
+    if (!isRecord(error) || error["code"] !== "ENOENT") {
+      throw new CodexSecurityError(
+        `Cannot read Codex configuration at ${source}.`,
+        {
+          cause: error,
+        },
+      );
+    }
+  }
+
+  const ambientSelection = selectedPermissionConfiguration(ambient);
+  const requestedSelection = selectedPermissionConfiguration(config);
+  const combinedProfiles = mergePermissionProfiles(
+    ambientSelection.profiles,
+    requestedSelection.profiles,
+  );
+  const inherited =
+    typeof ambientSelection.selected === "string"
+      ? resolvedPermissionFilesystem(
+          ambientSelection.profiles,
+          ambientSelection.selected,
+          source,
+        )
+      : { entries: {}, workspaceRoots: [] };
+  const explicit: PermissionFilesystem[] = [];
+  if (typeof requestedSelection.selected === "string") {
+    explicit.push(
+      resolvedPermissionFilesystem(
+        combinedProfiles,
+        requestedSelection.selected,
+        "explicit Codex configuration",
+      ),
+    );
+  }
+  if (
+    Object.hasOwn(requestedSelection.profiles, SCAN_PERMISSION_PROFILE) &&
+    requestedSelection.selected !== SCAN_PERMISSION_PROFILE
+  ) {
+    explicit.push(
+      resolvedPermissionFilesystem(
+        combinedProfiles,
+        SCAN_PERMISSION_PROFILE,
+        "explicit Codex configuration",
+      ),
+    );
+  }
+
+  let explicitDenials: JsonObject = {};
+  for (const profile of explicit) {
+    explicitDenials = mergeFilesystemDenials(
+      explicitDenials,
+      filesystemDenials(profile, repository),
+    );
+  }
+  const denied = mergeFilesystemDenials(
+    filesystemDenials(inherited, repository),
+    explicitDenials,
+  );
+  if (Object.keys(denied).length === 0) return { config, explicitDenials };
+
+  const configuredPermissions = isRecord(config["permissions"])
+    ? config["permissions"]
+    : {};
+  return {
+    config: {
+      ...config,
+      permissions: {
+        ...configuredPermissions,
+        [SCAN_PERMISSION_PROFILE]: { filesystem: denied },
+      },
+    },
+    explicitDenials,
+  };
+}
+
+function selectedPermissionConfiguration(config: JsonObject): {
+  selected: unknown;
+  profiles: JsonObject;
+} {
+  const rootProfiles = isRecord(config["permissions"])
+    ? (config["permissions"] as JsonObject)
+    : {};
+  const selectedName = config["profile"];
+  const configurationProfiles = config["profiles"];
+  const selectedProfile =
+    typeof selectedName === "string" &&
+    isRecord(configurationProfiles) &&
+    Object.hasOwn(configurationProfiles, selectedName) &&
+    isRecord(configurationProfiles[selectedName])
+      ? configurationProfiles[selectedName]
+      : undefined;
+  const selectedProfiles =
+    selectedProfile !== undefined && isRecord(selectedProfile["permissions"])
+      ? (selectedProfile["permissions"] as JsonObject)
+      : {};
+  return {
+    selected:
+      selectedProfile !== undefined &&
+      Object.hasOwn(selectedProfile, "default_permissions")
+        ? selectedProfile["default_permissions"]
+        : config["default_permissions"],
+    profiles: mergePermissionProfiles(rootProfiles, selectedProfiles),
+  };
+}
+
+function mergePermissionProfiles(
+  lower: JsonObject,
+  higher: JsonObject,
+): JsonObject {
+  const merged = structuredClone(lower);
+  for (const [name, value] of Object.entries(higher)) {
+    const previous = merged[name];
+    if (!isRecord(previous) || !isRecord(value)) {
+      merged[name] = structuredClone(value);
+      continue;
+    }
+    const profile: JsonObject = { ...previous, ...value } as JsonObject;
+    for (const key of ["filesystem", "workspace_roots"]) {
+      if (isRecord(previous[key]) && isRecord(value[key])) {
+        profile[key] = mergePermissionEntries(
+          previous[key] as JsonObject,
+          value[key] as JsonObject,
+        );
+      }
+    }
+    merged[name] = profile;
+  }
+  return merged;
+}
+
+function mergePermissionEntries(
+  lower: JsonObject,
+  higher: JsonObject,
+): JsonObject {
+  const merged = structuredClone(lower);
+  for (const [path, value] of Object.entries(higher)) {
+    const previous = merged[path];
+    merged[path] =
+      isRecord(previous) && isRecord(value)
+        ? ({ ...previous, ...value } as JsonObject)
+        : structuredClone(value);
+  }
+  return merged;
+}
+
+function resolvedPermissionFilesystem(
+  profiles: JsonObject,
+  selected: string,
+  source: string,
+): PermissionFilesystem {
+  const inherited: JsonObject[] = [];
+  const visited = new Set<string>();
+  let current: string | undefined = selected;
+  while (current !== undefined && !current.startsWith(":")) {
+    const profile = profiles[current];
+    if (visited.has(current) || !isRecord(profile)) {
+      throw new CodexSecurityError(
+        `Cannot resolve Codex filesystem permissions from ${source}.`,
+      );
+    }
+    visited.add(current);
+    inherited.push(profile as JsonObject);
+    const parent = profile["extends"];
+    if (parent !== undefined && typeof parent !== "string") {
+      throw new CodexSecurityError(
+        `Cannot resolve Codex filesystem permissions from ${source}.`,
+      );
+    }
+    current = parent as string | undefined;
+  }
+
+  let entries: JsonObject = {};
+  let workspaceRoots: JsonObject = {};
+  for (const profile of inherited.reverse()) {
+    const filesystem = profile["filesystem"];
+    const roots = profile["workspace_roots"];
+    if (
+      (filesystem !== undefined && !isRecord(filesystem)) ||
+      (roots !== undefined && !isRecord(roots))
+    ) {
+      throw new CodexSecurityError(
+        `Cannot resolve Codex filesystem permissions from ${source}.`,
+      );
+    }
+    if (isRecord(filesystem)) {
+      entries = mergePermissionEntries(entries, filesystem as JsonObject);
+    }
+    if (isRecord(roots)) {
+      workspaceRoots = mergePermissionEntries(
+        workspaceRoots,
+        roots as JsonObject,
+      );
+    }
+  }
+  return {
+    entries,
+    workspaceRoots: Object.entries(workspaceRoots)
+      .filter(([, enabled]) => enabled === true)
+      .map(([path]) =>
+        path === "~"
+          ? homedir()
+          : path.startsWith("~/")
+            ? join(homedir(), path.slice(2))
+            : resolve(path),
+      ),
+  };
+}
+
+function filesystemDenials(
+  profile: PermissionFilesystem,
+  repository: string,
+): JsonObject {
+  const denied: JsonObject = {};
+  for (const [path, access] of Object.entries(profile.entries)) {
+    if (path === "glob_scan_max_depth") {
+      denied[path] = structuredClone(access);
+    } else if (access === "deny" || access === "none") {
+      denied[path] = "deny";
+    } else if (isRecord(access)) {
+      const scoped = Object.fromEntries(
+        Object.entries(access)
+          .filter(([, value]) => value === "deny" || value === "none")
+          .map(([subpath]) => [subpath, "deny"]),
+      ) as JsonObject;
+      if (Object.keys(scoped).length > 0) denied[path] = scoped;
+    }
+  }
+
+  const workspaceDenials = denied[":workspace_roots"];
+  const workspaceRoots = new Set([
+    process.cwd(),
+    repository,
+    ...profile.workspaceRoots,
+  ]);
+  if (workspaceDenials === "deny") {
+    for (const root of workspaceRoots) {
+      denied[root] = "deny";
+    }
+  } else if (isRecord(workspaceDenials)) {
+    for (const root of workspaceRoots) {
+      const existing = denied[root];
+      if (existing !== "deny") {
+        denied[root] = isRecord(existing)
+          ? mergePermissionEntries(
+              existing as JsonObject,
+              workspaceDenials as JsonObject,
+            )
+          : structuredClone(workspaceDenials as JsonObject);
+      }
+    }
+  }
+  return denied;
+}
+
+function mergeFilesystemDenials(
+  lower: JsonObject,
+  higher: JsonObject,
+): JsonObject {
+  const merged = mergePermissionEntries(lower, higher);
+  for (const [path, access] of Object.entries(lower)) {
+    if (access === "deny" || higher[path] === "deny") merged[path] = "deny";
+  }
+  const inheritedDepth = lower["glob_scan_max_depth"];
+  const additionalDepth = higher["glob_scan_max_depth"];
+  const hasDeniedGlob = (entries: JsonObject): boolean =>
+    Object.entries(entries).some(
+      ([path, access]) =>
+        (access === "deny" && /[*?[\]]/u.test(path)) ||
+        (isRecord(access) &&
+          Object.entries(access).some(
+            ([subpath, scopedAccess]) =>
+              scopedAccess === "deny" && /[*?[\]]/u.test(subpath),
+          )),
+    );
+  const inheritedHasGlob = hasDeniedGlob(lower);
+  const additionalHasGlob = hasDeniedGlob(higher);
+  if (inheritedHasGlob && additionalHasGlob) {
+    if (
+      typeof inheritedDepth === "number" &&
+      typeof additionalDepth === "number"
+    ) {
+      merged["glob_scan_max_depth"] = Math.max(inheritedDepth, additionalDepth);
+    } else {
+      delete merged["glob_scan_max_depth"];
+    }
+  } else if (inheritedHasGlob) {
+    if (inheritedDepth === undefined) {
+      delete merged["glob_scan_max_depth"];
+    } else {
+      merged["glob_scan_max_depth"] = inheritedDepth;
+    }
+  } else if (additionalHasGlob) {
+    if (additionalDepth === undefined) {
+      delete merged["glob_scan_max_depth"];
+    } else {
+      merged["glob_scan_max_depth"] = additionalDepth;
+    }
+  } else if (
+    typeof inheritedDepth === "number" &&
+    typeof additionalDepth === "number"
+  ) {
+    merged["glob_scan_max_depth"] = Math.max(inheritedDepth, additionalDepth);
+  } else if (inheritedDepth === undefined && Object.keys(lower).length > 0) {
+    delete merged["glob_scan_max_depth"];
+  }
+  return merged;
+}
+
 export function scanRuntimeCodexConfig(
   config: JsonObject,
   stateDirectory: string,
@@ -2849,6 +3264,40 @@ export function scanRuntimeCodexConfig(
   const configuredPermissions = isRecord(hardened["permissions"])
     ? hardened["permissions"]
     : {};
+  const configuredProfile = configuredPermissions[SCAN_PERMISSION_PROFILE];
+  const configuredFilesystem =
+    isRecord(configuredProfile) && isRecord(configuredProfile["filesystem"])
+      ? configuredProfile["filesystem"]
+      : {};
+  const filesystem: JsonObject = {
+    ":root": "read",
+    ":workspace_roots": "write",
+    [stateDirectory]: "write",
+    ...(protectedCredentialHome === undefined
+      ? {}
+      : { [protectedCredentialHome]: "read" }),
+  };
+  for (const [path, access] of Object.entries(configuredFilesystem)) {
+    if (path === "glob_scan_max_depth") {
+      filesystem[path] = structuredClone(access);
+    } else if (access === "deny" || access === "none") {
+      filesystem[path] = "deny";
+    } else if (isRecord(access)) {
+      const denied = Object.fromEntries(
+        Object.entries(access)
+          .filter(([, value]) => value === "deny" || value === "none")
+          .map(([subpath]) => [subpath, "deny"]),
+      ) as JsonObject;
+      if (Object.keys(denied).length === 0) continue;
+      const existing = filesystem[path];
+      if (existing === "deny") continue;
+      filesystem[path] = {
+        ...(typeof existing === "string" ? { ".": existing } : {}),
+        ...(isRecord(existing) ? existing : {}),
+        ...denied,
+      } as JsonObject;
+    }
+  }
   return {
     ...hardened,
     approval_policy: "never",
@@ -2857,14 +3306,7 @@ export function scanRuntimeCodexConfig(
     permissions: {
       ...configuredPermissions,
       [SCAN_PERMISSION_PROFILE]: {
-        filesystem: {
-          ":root": "read",
-          ":workspace_roots": "write",
-          [stateDirectory]: "write",
-          ...(protectedCredentialHome === undefined
-            ? {}
-            : { [protectedCredentialHome]: "read" }),
-        },
+        filesystem,
       },
     },
   };
@@ -2878,6 +3320,17 @@ function sharedCredentialCodexConfig(
   const shared: JsonObject = {
     features: { plugins: true },
   };
+  const configuredPermissions = config["permissions"];
+  const configuredProfile = isRecord(configuredPermissions)
+    ? configuredPermissions[SCAN_PERMISSION_PROFILE]
+    : undefined;
+  if (isRecord(configuredProfile)) {
+    shared["permissions"] = {
+      [SCAN_PERMISSION_PROFILE]: structuredClone(
+        configuredProfile as JsonObject,
+      ),
+    };
+  }
   for (const key of [
     "cli_auth_credentials_store",
     "forced_login_method",

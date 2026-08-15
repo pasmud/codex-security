@@ -702,10 +702,12 @@ Every scan uses the `codex_security_scan` filesystem profile and
 `approvalPolicy: "never"`. Its profile allows reads of the local filesystem and
 writes to workspace roots and the selected scan state directory. Scans do not
 request interactive approval or grant filesystem escalations. Setting
-`approval_policy`, `approvals_reviewer`, `sandbox_mode`, or permissions
-through `--codex` or SDK `codexOverrides` does not replace these controls or
-make the filesystem profile more restrictive. Independently enforced host and
-network restrictions still apply.
+`approval_policy`, `approvals_reviewer`, or `sandbox_mode` through `--codex` or
+SDK `codexOverrides` does not replace these controls. Filesystem denials from
+your active Codex permission profile are preserved, including inherited and
+workspace-scoped rules. Additional filesystem denials can be supplied through
+`--codex` or SDK `codexOverrides`; read or write overrides cannot weaken the scan
+profile. Independently enforced host and network restrictions still apply.
 
 Scan and workbench subprocesses can inherit your environment, including
 unrelated API tokens and cloud credentials. Start a scan with only the

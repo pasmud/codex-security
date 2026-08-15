@@ -368,6 +368,57 @@ describe("CodexSecurity preflight configuration", () => {
     });
   });
 
+  test("adds only filesystem denials to the hardened scan profile", () => {
+    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
+    const deniedFile = join(tmpdir(), "codex-security-secret.env");
+    const ignoredWrite = join(tmpdir(), "codex-security-unapproved-write");
+    const config = scanRuntimeCodexConfig(
+      {
+        permissions: {
+          codex_security_scan: {
+            filesystem: {
+              glob_scan_max_depth: 5,
+              ":root": "write",
+              ":workspace_roots": {
+                ".": "read",
+                "**/*.env": "deny",
+                "legacy.secret": "none",
+                generated: "write",
+              },
+              [stateDirectory]: "deny",
+              [deniedFile]: "none",
+              [ignoredWrite]: "write",
+            },
+          },
+        },
+      },
+      stateDirectory,
+    );
+
+    expect(config).toMatchObject({
+      approval_policy: "never",
+      default_permissions: "codex_security_scan",
+      permissions: {
+        codex_security_scan: {
+          filesystem: {
+            glob_scan_max_depth: 5,
+            ":root": "read",
+            ":workspace_roots": {
+              ".": "write",
+              "**/*.env": "deny",
+              "legacy.secret": "deny",
+            },
+            [stateDirectory]: "deny",
+            [deniedFile]: "deny",
+          },
+        },
+      },
+    });
+    const permissions = config["permissions"] as JsonObject;
+    const profile = permissions["codex_security_scan"] as JsonObject;
+    expect(profile["filesystem"]).not.toHaveProperty(ignoredWrite);
+  });
+
   test("removes execution and permission overrides from every configured profile", () => {
     const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const original = {

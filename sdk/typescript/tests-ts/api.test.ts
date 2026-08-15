@@ -21,7 +21,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Codex, type CodexOptions, type ThreadEvent } from "@openai/codex-sdk";
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { parse as parseToml } from "smol-toml";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import {
   AuthenticationRequiredError,
   CodexSecurity,
@@ -4255,6 +4255,248 @@ describe("CodexSecurity orchestration", () => {
     expect(runtimeHomes).toEqual([credentialHome, credentialHome]);
   });
 
+  test("inherits active ambient filesystem denials without widening scan permissions", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    const stateDirectory = join(root, "state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    const scanDir = join(root, "scan");
+    const otherWorkspace = join(root, "additional-workspace");
+    const inheritedSecret = join(root, "inherited-secret.env");
+    const inheritedThenAllowed = join(root, "allowed-by-child.env");
+    const explicitSecret = join(root, "explicit-secret.env");
+    const directSecret = join(root, "direct-secret.env");
+    const ignoredWrite = join(root, "not-writable");
+    let savedConfiguration: JsonObject | undefined;
+    await Promise.all(
+      [repository, ambientHome, scanDir, otherWorkspace].map((path) =>
+        mkdir(path, { mode: 0o700 }),
+      ),
+    );
+    await writeFile(
+      join(ambientHome, "config.toml"),
+      stringifyToml({
+        default_permissions: "selected",
+        permissions: {
+          base: {
+            workspace_roots: { [otherWorkspace]: true },
+            filesystem: {
+              glob_scan_max_depth: 4,
+              ":root": "read",
+              ":workspace_roots": {
+                "**/*.env": "deny",
+                "legacy.secret": "none",
+                "allowed.txt": "read",
+              },
+              "~/.ssh": "none",
+              [inheritedSecret]: "deny",
+              [inheritedThenAllowed]: "deny",
+            },
+          },
+          selected: {
+            extends: "base",
+            filesystem: { [inheritedThenAllowed]: "read" },
+          },
+        },
+      }),
+    );
+    const client = new TestClient(
+      {
+        pluginPath: PLUGIN_ROOT,
+        codexOverrides: {
+          default_permissions: "explicit",
+          permissions: {
+            explicit: {
+              filesystem: {
+                [explicitSecret]: "deny",
+                [inheritedSecret]: "read",
+                ":root": "write",
+              },
+            },
+            codex_security_scan: {
+              filesystem: {
+                [directSecret]: "deny",
+                [ignoredWrite]: "write",
+              },
+            },
+          },
+        },
+      },
+      {
+        environment: {
+          CODEX_HOME: ambientHome,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+          OPENAI_API_KEY: "synthetic-transient-key",
+        },
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          if (args[0] === "register-cli-scan") {
+            const recipe = JSON.parse(
+              args[args.indexOf("--recipe-json") + 1]!,
+            ) as { config: JsonObject };
+            savedConfiguration = recipe.config;
+          }
+          return mockWorkbench(args);
+        },
+        createCodex: () => {
+          throw new Error("inherited permissions captured");
+        },
+      },
+    );
+
+    try {
+      await expect(client.run(repository)).rejects.toThrow(
+        "inherited permissions captured",
+      );
+      const generated = parseToml(
+        await readFile(join(credentialHome, "config.toml"), "utf8"),
+      );
+      const permissions = generated["permissions"] as JsonObject;
+      const profile = permissions["codex_security_scan"] as JsonObject;
+      const filesystem = profile["filesystem"] as JsonObject;
+      expect(filesystem).toEqual({
+        glob_scan_max_depth: 4,
+        ":root": "read",
+        ":workspace_roots": {
+          ".": "write",
+          "**/*.env": "deny",
+          "legacy.secret": "deny",
+        },
+        [stateDirectory]: "write",
+        [credentialHome]: "read",
+        [process.cwd()]: { "**/*.env": "deny", "legacy.secret": "deny" },
+        [repository]: { "**/*.env": "deny", "legacy.secret": "deny" },
+        [otherWorkspace]: { "**/*.env": "deny", "legacy.secret": "deny" },
+        "~/.ssh": "deny",
+        [inheritedSecret]: "deny",
+        [explicitSecret]: "deny",
+        [directSecret]: "deny",
+      });
+      expect(filesystem).not.toHaveProperty(inheritedThenAllowed);
+      expect(filesystem).not.toHaveProperty(ignoredWrite);
+      expect(savedConfiguration).toMatchObject({
+        default_permissions: "codex_security_scan",
+        permissions: {
+          codex_security_scan: {
+            filesystem: {
+              [explicitSecret]: "deny",
+              [directSecret]: "deny",
+            },
+          },
+        },
+      });
+      const savedPermissions = savedConfiguration!["permissions"] as JsonObject;
+      const savedProfile = savedPermissions[
+        "codex_security_scan"
+      ] as JsonObject;
+      expect(savedProfile["filesystem"]).not.toHaveProperty(inheritedSecret);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("refreshes ambient filesystem denials when a persistent scan client reruns", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    const stateDirectory = join(root, "state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    const firstSecret = join(root, "first-secret.env");
+    const secondSecret = join(root, "second-secret.env");
+    await Promise.all([repository, ambientHome].map((path) => mkdir(path)));
+    let scanIndex = 0;
+    const client = new TestClient(
+      { pluginPath: PLUGIN_ROOT },
+      {
+        environment: {
+          CODEX_HOME: ambientHome,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+          OPENAI_API_KEY: "synthetic-transient-key",
+        },
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => {
+          const output = join(root, `scan-${scanIndex++}`);
+          await mkdir(output, { mode: 0o700 });
+          return output;
+        },
+        repositoryRevision: async () => "deadbeef",
+        createCodex: () => {
+          throw new Error("persistent permissions captured");
+        },
+      },
+    );
+
+    try {
+      for (const secret of [firstSecret, secondSecret]) {
+        await writeFile(
+          join(ambientHome, "config.toml"),
+          stringifyToml({
+            default_permissions: "selected",
+            permissions: {
+              selected: { filesystem: { [secret]: "deny" } },
+            },
+          }),
+        );
+        await expect(client.run(repository)).rejects.toThrow(
+          "persistent permissions captured",
+        );
+        const generated = parseToml(
+          await readFile(join(credentialHome, "config.toml"), "utf8"),
+        );
+        const permissions = generated["permissions"] as JsonObject;
+        const profile = permissions["codex_security_scan"] as JsonObject;
+        expect(profile["filesystem"]).toMatchObject({ [secret]: "deny" });
+      }
+      const final = parseToml(
+        await readFile(join(credentialHome, "config.toml"), "utf8"),
+      );
+      const permissions = final["permissions"] as JsonObject;
+      const profile = permissions["codex_security_scan"] as JsonObject;
+      expect(profile["filesystem"]).not.toHaveProperty(firstSecret);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("fails before runtime startup when ambient permissions cannot be resolved", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    await Promise.all([repository, ambientHome].map((path) => mkdir(path)));
+    await writeFile(
+      join(ambientHome, "config.toml"),
+      stringifyToml({
+        default_permissions: "selected",
+        permissions: {
+          selected: { extends: "missing" },
+        },
+      }),
+    );
+    const client = new TestClient(
+      { pluginPath: PLUGIN_ROOT },
+      {
+        environment: {
+          CODEX_HOME: ambientHome,
+          OPENAI_API_KEY: "synthetic-transient-key",
+        },
+        createCodex: () => {
+          throw new Error("Codex must not start");
+        },
+      },
+    );
+
+    try {
+      await expect(client.run(repository)).rejects.toThrow(
+        "Cannot resolve Codex filesystem permissions",
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
   test.each([
     ["OpenAI", undefined, "OPENAI_API_KEY", "gpt-5.6-sol", undefined],
     ...EXTERNAL_PROVIDER_CASES,
@@ -4440,6 +4682,109 @@ describe("CodexSecurity orchestration", () => {
         });
       }
       expect(scansStarted).toBe(2);
+    } finally {
+      await Promise.all(clients.map(async (client) => await client.close()));
+    }
+  });
+
+  test("loads each concurrent scan and follow-up with its own filesystem denials", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDirectory = join(root, "state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    await mkdir(repository);
+    let activeScans = 0;
+    let followUpsStarted = 0;
+    let releaseScans!: () => void;
+    const concurrentScans = new Promise<void>((resolve) => {
+      releaseScans = resolve;
+    });
+
+    const clients = await Promise.all(
+      [0, 1].map(async (index) => {
+        const scanDir = join(root, `isolated-permission-scan-${index}`);
+        const denied = join(root, `private-${index}.env`);
+        await mkdir(scanDir, { mode: 0o700 });
+        return new TestClient(
+          {
+            pluginPath: PLUGIN_ROOT,
+            codexOverrides: {
+              permissions: {
+                codex_security_scan: { filesystem: { [denied]: "deny" } },
+              },
+            },
+          },
+          {
+            environment: {
+              CODEX_SECURITY_STATE_DIR: stateDirectory,
+              OPENAI_API_KEY: `synthetic-key-${index}`,
+            },
+            resolvePluginPython: async () => "/managed/python",
+            prepareOutputDir: async () => scanDir,
+            repositoryRevision: async () => "deadbeef",
+            createCodex: (options: CodexOptions) => ({
+              startThread: () => ({
+                id: null,
+                async runStreamed(input: string) {
+                  return {
+                    events: (async function* () {
+                      expect(options.env?.["CODEX_HOME"]).toBe(credentialHome);
+                      const configured = parseToml(
+                        await readFile(
+                          join(credentialHome, "config.toml"),
+                          "utf8",
+                        ),
+                      );
+                      const permissions = configured[
+                        "permissions"
+                      ] as JsonObject;
+                      const profile = permissions[
+                        "codex_security_scan"
+                      ] as JsonObject;
+                      expect(profile["filesystem"]).toMatchObject({
+                        [denied]: "deny",
+                      });
+                      yield {
+                        type: "thread.started" as const,
+                        thread_id: `isolated-permission-thread-${index}`,
+                      };
+                      if (input === "Check the completed scan.") {
+                        followUpsStarted += 1;
+                        return;
+                      }
+                      if (++activeScans === 2) releaseScans();
+                      await concurrentScans;
+                      throw new Error(
+                        "parallel isolated permission scan reached",
+                      );
+                    })(),
+                  };
+                },
+              }),
+            }),
+          },
+        );
+      }),
+    );
+
+    try {
+      const results = await Promise.allSettled(
+        clients.map((client) =>
+          client.run(repository, {
+            postScanPrompt: "Check the completed scan.",
+          }),
+        ),
+      );
+      for (const result of results) {
+        expect(result).toMatchObject({
+          status: "rejected",
+          reason: expect.objectContaining({
+            message: "parallel isolated permission scan reached",
+          }),
+        });
+      }
+      expect(activeScans).toBe(2);
+      expect(followUpsStarted).toBe(2);
     } finally {
       await Promise.all(clients.map(async (client) => await client.close()));
     }
