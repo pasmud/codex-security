@@ -250,6 +250,10 @@ const PROVIDER_OPTION = z
   .enum(["openai", "openrouter", "fireworks", "amazon-bedrock"])
   .default("openai")
   .describe("Inference provider for scans.");
+const CREATE_PR_OPTION = z
+  .boolean()
+  .default(false)
+  .describe("Create a GitHub pull request after verified patches.");
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -742,11 +746,6 @@ interface SelectedFindings {
   repository: string;
   scanId: string;
   findings: Finding[];
-}
-
-interface CreatedPullRequest {
-  branch: string;
-  url: string;
 }
 
 interface CliDependencies {
@@ -2076,10 +2075,7 @@ export async function main(
             .enum(REPORTABLE_SEVERITIES)
             .optional()
             .describe("Patch findings at or above LEVEL; requires --patch."),
-          createPr: z
-            .boolean()
-            .default(false)
-            .describe("Create a GitHub pull request after verified patches."),
+          createPr: CREATE_PR_OPTION,
           maxCost: z
             .number()
             .positive()
@@ -2620,10 +2616,7 @@ export async function main(
           .optional()
           .describe("JSON Linear issue filter for --linear-project."),
         linearApiKey: linearApiKeyOption(),
-        createPr: z
-          .boolean()
-          .default(false)
-          .describe("Create a GitHub pull request after verified patches."),
+        createPr: CREATE_PR_OPTION,
         codex: z
           .array(optionValue("--codex"))
           .default([])
@@ -3538,24 +3531,19 @@ async function createPatchPullRequest(
   patches: readonly FindingPatch[],
   stderr: Writable,
   dependencies: CliDependencies,
-): Promise<CreatedPullRequest | undefined> {
+): Promise<{ branch: string; url: string } | undefined> {
   const files = [
     ...new Set(
-      patches
-        .filter(({ status }) => status === "verified")
-        .flatMap(({ files }) => files),
+      patches.flatMap(({ status, files }) =>
+        status === "verified" ? files : [],
+      ),
     ),
   ].map((file) => {
     const path = relative(
       selected.repository,
       resolve(selected.repository, file),
     );
-    if (
-      path === "" ||
-      path === ".." ||
-      path.startsWith(`..${sep}`) ||
-      isAbsolute(path)
-    ) {
+    if (path === "" || isOutsidePath(path)) {
       throw new CodexSecurityError(
         "Patch files must remain inside the scanned repository.",
       );
@@ -3829,7 +3817,7 @@ async function runSkill(
     JSON.stringify(contents),
   ].join("\n");
   const patch = skill === "fix-finding";
-  return await dependencies.runCodex(
+  return dependencies.runCodex(
     [
       ...(patch ? ["app-server"] : ["exec", "--ignore-user-config"]),
       "--disable",
